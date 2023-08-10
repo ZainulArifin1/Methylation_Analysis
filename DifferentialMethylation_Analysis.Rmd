@@ -1,0 +1,294 @@
+---
+title: "Differentially Methylated Analysis: Soft vs Stiff"
+author: "Zain Arifin"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+  
+# Methylation Data Analysis
+
+## Background
+
+In the organoids, there are different properties whether or not the tumor comes from a soft or stiff environment. 
+In this study, we would like to see if the samples of soft and stiff have a differential methylation pattern which regulates
+the genes of interest. In particular, we would like to examine the ratio of methylated vs unmethylated for the gene of interest.
+      
+## Problem
+
+As expected, genes are not methylated uniformly. Some genes have a high amount sites which have information, while most genes do not.
+For instance, some genes have a methylation ratio of 0.7 (70/70+30) but somee genes have a methylation ratio of
+0.9 (9/9+1). In this case even though 0.9 > 0.7, by seeing this observation we would prefer to trust the 0.7 more than the 0.9
+simply becaus of the n size. Also we are also interested to compare the methylation condition of soft and stiff.
+This comparison must take into account:
+  
+  1. The number of initial sites of methylation for both sites.
+  2. The difference of ratio that are considered statistically significant. 
+  
+# Data input (from DifferentialMethylation_FilesGeneration.R)
+
+```{r}
+setwd("/home/zarifin_1/methylation")
+suppressMessages(library(tidyverse))
+suppressMessages(library(GenomicRanges))
+suppressMessages(library(AnnotationHub))
+suppressMessages(library(IRanges))
+suppressMessages(library(ggrepel))
+suppressMessages(library(cowplot))
+suppressMessages(library(readxl))  
+suppressMessages(library(stats))
+suppressMessages(library(EnhancedVolcano))
+
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    # I prefer straight data.frames
+    # but if you like tidyverse tibbles (the default with read_excel)
+    # then just pass tibble = TRUE
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+df_list <- readRDS("results/df_list_with_gene.rds")
+ratio_table <- read_excel_allsheets("results/ratio_table.xlsx")
+for (i in 1:length(ratio_table)){
+  colnames(ratio_table[[i]]) <- paste0(colnames(ratio_table[[i]]),"_",names(ratio_table[i]))
+  colnames(ratio_table[[i]])[1] <- "gene"
+}
+```
+
+## Calculate differentially methylated between soft and stiff
+
+# method 1: Z-Statistical Test
+
+Reasoning:
+z-statistical test is valid when the following assumptions are met:
+
+1. The two conditions are independent of one another.
+2. Data are normally distributed.
+
+In this case assumption 1 is met, however biological data with large observations tend to not be normally distributed. This is indicated by a large left skew of the data ratio distribution.
+
+```{r}
+comb_tbl <- inner_join(ratio_table[[1]], ratio_table[[2]])
+
+comb_tbl_z <- comb_tbl %>%
+  dplyr::mutate(raw_diff = prop_soft - prop_stiff, 
+                p_hat = ((prop_soft*n_gene_soft)+(prop_stiff*n_gene_stiff))/
+                  (n_gene_soft + n_gene_stiff)) %>%
+  dplyr::mutate(divider = sqrt(p_hat*(1-p_hat) * ((1/n_gene_soft) + (1/n_gene_stiff)))) %>%
+  dplyr::mutate(z_test = raw_diff / divider) %>%
+  dplyr::mutate(p_val = 2*pnorm(q = -abs(z_test))) %>% #two tailed p-val
+  dplyr::mutate(p_val_adjusted = p.adjust(p_val, 
+                                          method = "BH", 
+                                          n = nrow(comb_tbl)))
+
+# instead of bonferonni, we use Benjamini-Hochberg that control for FDR. This is less stringent and works better given the data. 
+
+comb_tbl_z <- comb_tbl_z %>% 
+  dplyr::group_by(gene) %>%
+  dplyr::slice(1L) %>%
+  ungroup()
+rownames(comb_tbl_z) <- comb_tbl_z$gene
+
+comb_tbl_z <- comb_tbl_z %>% arrange((p_val_adjusted))
+
+write_csv(comb_tbl_z, "results/z_test_differentially_methylated.csv")
+
+```
+```{r}
+head(comb_tbl_z)
+```
+
+
+# Method 2: Fisher Exact Test
+
+Fisher Exact test is valid when the following assumptions are met:
+
+1. The two conditions are independent of one another.
+2. The data are categorical
+
+As Fisher Exact test can be use for non-parametric data with skew, from assumptions point of view, it is more precise to use Fisher test. The downside is that Fisher exact test is more computationally expensive compared to z-statistical test.
+
+Also, the p-value correction method is critical. For instance, FDR correction with Bonferonni (very strict) results in 261 differentially methylated genes whereas the use of Benjaminni-Hochberg (BH) resulted in 1294 differentially methylated genes. 
+
+```{r}
+comb_tbl <- inner_join(ratio_table[[1]], ratio_table[[2]])
+comb_tbl$odds_ratio <- NA
+comb_tbl$p_val <- NA
+
+
+for (i in 1:nrow(comb_tbl)){
+  temp <- comb_tbl[i,]
+  temp <- data.frame("soft" = c(temp$prop_soft*temp$n_gene_soft,
+                                (1 - temp$prop_soft)*temp$n_gene_soft),
+                     "stiff" = c(temp$prop_stiff*temp$n_gene_stiff,
+                                (1 - temp$prop_stiff)*temp$n_gene_stiff),
+                     row.names = c("methylated", "unmethylated")
+                     )
+  temp_test <- fisher.test(temp)
+  temp_df <- data.frame("odds_ratio" = temp_test$estimate, "p_val" = temp_test$p.value)
+  comb_tbl[i,c("odds_ratio", "p_val")] <- temp_df
+}
+
+comb_tbl_fisher <- comb_tbl %>%
+  dplyr::mutate(p_val_adjusted = p.adjust(p_val, 
+                                        method = "BH", 
+                                        n = nrow(comb_tbl))) 
+# instead of Bonferonni correction, we use Benjamini-Hochberg that control for FDR. This is less stringent and works better given the data. 
+
+comb_tbl_fisher <- comb_tbl_fisher %>% 
+  dplyr::group_by(gene) %>%
+  dplyr::slice(1L) %>%
+  ungroup()
+rownames(comb_tbl_fisher) <- comb_tbl_fisher$gene
+
+comb_tbl_fisher <- comb_tbl_fisher %>% arrange((p_val_adjusted))
+
+write_csv(comb_tbl_fisher, "results/fisher_test_differentially_methylated.csv")
+```
+```{r}
+head(comb_tbl_fisher)
+```
+
+
+# Visualization
+```{r}
+# 1. Methylation size in soft vs stiff
+plot_corr_gene_size <- ggplot(data = comb_tbl_fisher, mapping = aes(x = n_gene_soft, n_gene_stiff)) +
+  geom_point() +
+  cowplot::theme_cowplot()
+
+png(filename = "results/methylation_size_dependency.png", res = 300, width = 7, height = 5, units = "in")
+plot_corr_gene_size
+dev.off()
+
+plot_corr_gene_size
+
+# 2. Volcano plot: log(odds ratio) vs adj-pval
+
+to_plot <- comb_tbl_fisher[,c("gene", "odds_ratio", "p_val_adjusted")]
+to_plot$logOddsRatio <- log(to_plot$odds_ratio)
+to_plot$pvalue <- to_plot$p_val_adjusted
+rownames(to_plot) <- to_plot$gene
+  
+volcano1 <- EnhancedVolcano(to_plot,
+  lab = rownames(to_plot),
+  x = 'logOddsRatio',
+  y = 'p_val_adjusted',
+  title = 'Differentially Methylated Site: Soft vs Stiff',
+  pCutoff = 0.05,
+  FCcutoff = log2(1.5),
+  pointSize = 3.0,
+  labSize = 6.0, 
+  xlab = "Log Odds Ratio",
+  ylab = "-Log10(FDR)",
+  legendPosition = 'right',
+  legendLabSize=-1, legendIconSize=-1)
+
+png(filename = "results/volcano_DiffMeth.png", res = 600, width = 12, height = 9, units = "in")
+print(volcano1)
+dev.off()
+
+volcano1
+
+
+# 3. Correlation between methylation proportion soft vs stiff
+gene_signif <- comb_tbl_fisher %>%
+  dplyr::filter(p_val_adjusted < 0.05 & abs(log(odds_ratio)) > log(1.5) ) %>%
+  dplyr::pull(gene)
+
+plot_corr_ratio <- ggplot(data = comb_tbl_fisher, mapping = aes(x = prop_soft, prop_stiff)) +
+  geom_point(color = "gray", alpha = 0.3) +
+  geom_point(data = comb_tbl_fisher %>% dplyr::filter(gene %in% gene_signif), 
+             mapping = aes(x = prop_soft, prop_stiff), color = "red") +
+  cowplot::theme_cowplot()
+
+png(filename = "results/corr_ratio.png", res = 300, width = 7, height = 5, units = "in")
+plot_corr_ratio
+dev.off()
+
+plot_corr_ratio
+
+# 4 Check gene of interest (supplied by Jane)
+gene_interest <- read_table("data/avg_methylation_WGBS.txt")
+
+comb_tbl_fisher_intersect <- comb_tbl_fisher %>% dplyr::filter(gene %in% gene_interest$gene)
+comb_tbl_fisher_intersect <- comb_tbl_fisher_intersect %>% dplyr::arrange(p_val_adjusted)
+
+comb_tbl_fisher_intersect
+```
+
+# Visualization with GVIZ
+
+```{r}
+library(Gviz)
+library(GenomicRanges)
+library(biomaRt)
+
+# itrack_full_hg38 <- readRDS("IdeogramTrack_hg38.rds") 
+#downloaded from local as it does not work from the server, it needs R4.3.1
+
+gene_name <- "SOX9"
+grange_list <- readRDS("results/grange_list.rds")
+
+test <- grange_list$soft[(elementMetadata(grange_list$soft)[, "gene"] %in% gene_name)]
+test <- test[(elementMetadata(test)[, "methylation"] %in% "Z")]
+max_test <- max(test@ranges@start)
+min_test <- min(test@ranges@start)
+
+test2 <- grange_list$stiff[(elementMetadata(grange_list$stiff)[, "gene"] %in% gene_name)]
+test2 <- test2[(elementMetadata(test2)[, "methylation"] == "Z")]
+max_test2 <- max(test2@ranges@start)
+min_test2 <- min(test2@ranges@start)
+
+max_fin <- ifelse(max_test > max_test2, max_test, max_test2)
+min_fin  <- ifelse(min_test < min_test2, min_test, min_test2)
+
+atrack <- AnnotationTrack(test, name = "SOFT", stacking = "squish")
+atrack2 <- AnnotationTrack(test2, name = "STIFF", stacking = "squish")
+
+#genome : "hg38" 
+gen<-"hg19"
+#Chromosme name : "chr7"
+chr <- as.character(unique(seqnames(test)))
+#Ideogram track
+itrack <- IdeogramTrack(genome = gen, chromosome = chr)
+
+
+# BIOMART hg19 track (somehow work for some genes? works completely fine on local weird...)
+# figure out the problem! png() is acting weird. Use pdf to save file instead
+bm <- useEnsembl(host = "https://grch37.ensembl.org", 
+                 biomart = "ENSEMBL_MART_ENSEMBL", 
+                 dataset = "hsapiens_gene_ensembl")
+# SSL peer certificate or SSH remote key was not OK: [uswest.ensembl.org] SSL certificate problem: certificate has expired
+# bm <- readRDS("data/ENSEMBL_MART_ENSEMBL_grch37.rds")
+biomTrack <- BiomartGeneRegionTrack(genome = "hg19", chromosome = chr, 
+                                    start = min_fin, end = max_fin,
+                                    name = "ENSEMBL", biomart = bm, 
+                                    transcriptAnnotation = "symbol")
+
+gtrack <- GenomeAxisTrack()
+
+pdf(paste0("results/chr_viz/",gene_name,"_chr_track.pdf"))
+print(Gviz::plotTracks(list(itrack, gtrack, atrack, atrack2, biomTrack), 
+                 showOverplotting = TRUE, background.panel = "#FFFEDB", 
+                 background.title = "darkblue"))
+dev.off()
+
+max_fin - min_fin
+```
+
+
+
+```{r}
+#run above
+
+## to do 
+# 1. Create data track
+# 2. Figure out whats a good bin size for ratio
+# 3. Figure out the best viz for this data 
+```
